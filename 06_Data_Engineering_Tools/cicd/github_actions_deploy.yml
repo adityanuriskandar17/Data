@@ -1,0 +1,106 @@
+# ============================================
+# CI/CD UNTUK DATA ENGINEERING
+# ============================================
+# GitHub Actions Pipeline
+# Bahasa Indonesia
+
+name: Data Pipeline CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "dbt/**"
+      - "dags/**"
+      - "spark-jobs/**"
+  pull_request:
+    branches: [main]
+
+jobs:
+  # --- JOB 1: LINTING & TEST ---
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install dbt-postgres sqlfluff pytest
+          pip install -r requirements.txt
+
+      - name: Lint SQL dengan SQLFluff
+        run: sqlfluff lint dbt/models/ --dialect postgres
+
+      - name: Lint Python dengan Flake8
+        run: flake8 dags/ spark-jobs/ --max-line-length=100
+
+      - name: Run unit tests
+        run: pytest tests/
+
+  # --- JOB 2: DEPLOY ke STAGING ---
+  deploy-staging:
+    needs: lint-and-test
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup dbt
+        run: |
+          pip install dbt-postgres
+          dbt debug --profiles-dir .dbt/staging
+
+      - name: dbt run (staging)
+        run: dbt run --profiles-dir .dbt/staging --target staging
+
+      - name: dbt test (staging)
+        run: dbt test --profiles-dir .dbt/staging --target staging
+
+      - name: Deploy Airflow DAGs
+        run: |
+          rsync -avz dags/ airflow@staging:/opt/airflow/dags/
+          ssh airflow@staging "airflow dags list"
+
+  # --- JOB 3: DEPLOY ke PRODUCTION ---
+  deploy-production:
+    needs: lint-and-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-southeast-1
+
+      - name: Deploy Spark jobs ke S3
+        run: |
+          aws s3 sync spark-jobs/ s3://company-data-lake-prod/scripts/
+          aws s3 cp requirements.txt s3://company-data-lake-prod/scripts/
+
+      - name: Update Glue job
+        run: |
+          aws glue update-job --job-name etl-orders-daily \
+            --job-update "Command={ScriptLocation=s3://company-data-lake-prod/scripts/etl_orders.py}"
+
+      - name: Deploy dbt ke production
+        run: |
+          pip install dbt-postgres
+          dbt run --profiles-dir .dbt/prod --target prod
+          dbt test --profiles-dir .dbt/prod --target prod
+
+      - name: Trigger Airflow DAG
+        run: |
+          curl -X POST "https://airflow.company.com/api/v1/dags/daily_etl_pipeline/dagRuns" \
+            -H "Authorization: Bearer ${{ secrets.AIRFLOW_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{}'
